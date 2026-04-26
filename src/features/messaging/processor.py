@@ -185,6 +185,8 @@ class WeChatGroupProcessor:
         tick: float = 0.1,
         batch_size: int = 8,
         tail_size: int = 8,
+        processing_workers: int = 2,
+        incoming_queue_maxsize: int = 0,
     ):
         self.client = client
         self.groups = list(dict.fromkeys(groups))
@@ -199,6 +201,8 @@ class WeChatGroupProcessor:
         self.tick = tick
         self.batch_size = batch_size
         self.tail_size = tail_size
+        self.processing_workers = processing_workers
+        self.incoming_queue_maxsize = incoming_queue_maxsize
 
         self._listener: Optional[WeChatGroupListener] = None
         self._action_queue: "queue.Queue[MessageAction]" = queue.Queue()
@@ -225,6 +229,8 @@ class WeChatGroupProcessor:
             tick=self.tick,
             batch_size=self.batch_size,
             tail_size=self.tail_size,
+            processing_workers=self.processing_workers,
+            incoming_queue_maxsize=self.incoming_queue_maxsize,
         )
         self._listener.start(block=False)
 

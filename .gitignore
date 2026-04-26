@@ -62,3 +62,9 @@ CLAUDE.md
 AGENTS.md
 .claude-plugin/
 .claude/
+
+# 本地跑记账机器人时生成
+wx4py.log
+wx4py_ocr_debug/
+examples/messaging/group_bookkeeping_config.json
+examples/data/
