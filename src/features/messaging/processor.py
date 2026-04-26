@@ -187,6 +187,7 @@ class WeChatGroupProcessor:
         tail_size: int = 8,
         processing_workers: int = 2,
         incoming_queue_maxsize: int = 0,
+        bring_subwindow_to_front: bool = False,
     ):
         self.client = client
         self.groups = list(dict.fromkeys(groups))
@@ -203,6 +204,7 @@ class WeChatGroupProcessor:
         self.tail_size = tail_size
         self.processing_workers = processing_workers
         self.incoming_queue_maxsize = incoming_queue_maxsize
+        self.bring_subwindow_to_front = bool(bring_subwindow_to_front)
 
         self._listener: Optional[WeChatGroupListener] = None
         self._action_queue: "queue.Queue[MessageAction]" = queue.Queue()
@@ -231,6 +233,7 @@ class WeChatGroupProcessor:
             tail_size=self.tail_size,
             processing_workers=self.processing_workers,
             incoming_queue_maxsize=self.incoming_queue_maxsize,
+            bring_subwindow_to_front=self.bring_subwindow_to_front,
         )
         self._listener.start(block=False)
 

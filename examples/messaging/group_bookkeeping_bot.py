@@ -1068,6 +1068,8 @@ def main() -> None:
                             # 必须为 1：并发 handle 会并发读写 runtime 与余额，导致原值/余额重复
                             processing_workers=1,
                             incoming_queue_maxsize=0,
+                            # 勿启 bring_subwindow_to_front：会反复抢前台，机器几乎无法操作；多群用 listener 的短轮询
+                            bring_subwindow_to_front=False,
                         )
                         active_groups = list(target_groups)
                         notified_waiting = False

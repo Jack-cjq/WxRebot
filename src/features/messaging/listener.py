@@ -790,6 +790,7 @@ class WeChatGroupListener:
         processing_workers: int = 2,
         incoming_queue_maxsize: int = 0,
         reply_send_interval: float = 0.0,
+        bring_subwindow_to_front: bool = False,
     ):
         self.client = client
         self.groups = list(dict.fromkeys(groups))
@@ -816,6 +817,8 @@ class WeChatGroupListener:
         self._thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._processor_threads: List[threading.Thread] = []
+        # 为 True 时每次拉取前抢前台，可能利于非激活子窗口的 UIA；会严重干扰本机操作，仅建议调试/无人值守
+        self.bring_subwindow_to_front = bool(bring_subwindow_to_front)
 
     @property
     def is_running(self) -> bool:
@@ -971,8 +974,20 @@ class WeChatGroupListener:
             self._enqueue_incoming(session, item)
         return added
 
+    def _try_focus_subwindow_for_read(self, session: _ListenSession) -> None:
+        if not self.bring_subwindow_to_front or not session.hwnd:
+            return
+        try:
+            if win32gui.IsIconic(session.hwnd):
+                win32gui.ShowWindow(session.hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(session.hwnd)
+        except Exception:
+            pass
+        time.sleep(0.03)
+
     def _poll_session(self, session: _ListenSession) -> None:
         session.scan_count += 1
+        self._try_focus_subwindow_for_read(session)
         added = 0
         try:
             # 两轮采样：首轮滚底+读；短休后无滚动再读，部分情况下 UIA 子树晚一帧才补全
@@ -1037,18 +1052,23 @@ class WeChatGroupListener:
 
     def _update_next_scan(self, session: _ListenSession, added: int) -> None:
         now = time.time()
+        # 多群时若仍用「长期无新消息则拉长 interval」，某些群在 UIA 上迟迟不出现 added，
+        # 会一直被当成空闲 → 0.5s/1.2s，形成「收不到消息 → 更难得扫到」的饥饿。多群统一短间隔单群可省电。
+        multi_group = len(self.sessions) > 1
         if added:
             session.last_message_at = now
-            # 有新消息时缩短扫描间隔，连发时更快补抓 UIA 尚未露出的气泡
             session.interval = 0.04
         else:
-            idle_for = now - session.last_message_at
-            if idle_for >= 120:
-                session.interval = 1.2
-            elif idle_for >= 30:
-                session.interval = 0.5
+            if multi_group:
+                session.interval = 0.1
             else:
-                session.interval = 0.04
+                idle_for = now - session.last_message_at
+                if idle_for >= 120:
+                    session.interval = 1.2
+                elif idle_for >= 30:
+                    session.interval = 0.5
+                else:
+                    session.interval = 0.04
         session.next_scan_at = now + session.interval
 
     def reply(self, group: str, content: str) -> bool:

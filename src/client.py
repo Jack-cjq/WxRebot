@@ -99,8 +99,8 @@ class WeChatClient:
             handlers: 一个或多个 MessageHandler。
             ignore_client_sent: 是否忽略本库发送后回流的消息。
             block: 是否阻塞当前线程运行监听循环。
-            **options: 传给监听器的调度参数，例如 tick、batch_size、tail_size、
-                reply_on_at、group_nicknames。
+            **options: 传给 WeChatGroupProcessor/监听器的参数，例如 tick、batch_size、
+                tail_size、reply_on_at、group_nicknames、bring_subwindow_to_front。
 
         Returns:
             WeChatGroupProcessor: 处理器实例，可调用 stop() 停止。
