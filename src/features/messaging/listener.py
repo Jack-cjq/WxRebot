@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """微信群聊监听与自动回复。
 
 该模块实现的是已在调试验证过的方案：
@@ -33,6 +33,14 @@ from ..chat import ChatWindow
 from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 列表虚拟化 / RuntimeId 复用时，同一条气泡可能被反复当成「新消息」。
+# 在 DUPLICATE_CONTENT_SUPPRESS_SECONDS 窗口内，同一归一化正文最多放行
+# MAX_IDENTICAL_CONTENT_EVENTS_PER_WINDOW 条（含），超过则丢弃——这样同一秒内两人发相同文案仍会各处理一次，
+# 而 UIA 对同一条的多次重复上报多数会在第 3 次起被挡住。
+DUPLICATE_CONTENT_SUPPRESS_SECONDS = 10.0
+CONTENT_RECENT_TTL_SECONDS = 120.0
+MAX_IDENTICAL_CONTENT_EVENTS_PER_WINDOW = 5
 
 WECHAT_EXE_NAMES = {"wechat.exe", "weixin.exe"}
 MESSAGE_CLASSES = {
@@ -75,6 +83,8 @@ class _ListenSession:
     root: object
     msg_list: object
     seen: Set[Tuple[Tuple[int, ...], str, str]]
+    """最近已投递处理器的正文（与时间戳），不受 tail 交集裁剪影响，用于抑制 UIA 重复上报。"""
+    content_recent: Deque[Tuple[float, str]] = field(default_factory=lambda: deque(maxlen=500))
     new_count: int = 0
     scan_count: int = 0
     fail_count: int = 0
@@ -114,16 +124,31 @@ class OutgoingMessageRegistry:
         self._records: Deque[_OutgoingRecord] = deque()
 
     def record(self, group: str, content: str, max_hits: int = 8) -> None:
-        content = _normalize_message_text(content)
-        if not content:
-            return
-        record = _OutgoingRecord(
-            group=group,
-            content=content,
-            expires_at=time.time() + self.ttl_seconds,
-            remaining_hits=max_hits,
-        )
-        self._records.append(record)
+        """记录整段正文及各行：微信 UIA 常把长回复拆成多条气泡，仅记整段会匹配不上回流。"""
+        raw = str(content or "")
+        chunks: List[str] = []
+        full = _normalize_message_text(raw)
+        if full:
+            chunks.append(full)
+        for line in raw.splitlines():
+            ln = _normalize_message_text(line)
+            if len(ln) >= 6:
+                chunks.append(ln)
+        seen_body: Set[str] = set()
+        now = time.time()
+        exp = now + self.ttl_seconds
+        for body in chunks:
+            if not body or body in seen_body:
+                continue
+            seen_body.add(body)
+            self._records.append(
+                _OutgoingRecord(
+                    group=group,
+                    content=body,
+                    expires_at=exp,
+                    remaining_hits=max_hits,
+                )
+            )
 
     def should_ignore(self, group: str, content: str) -> bool:
         now = time.time()
@@ -160,7 +185,7 @@ def _is_same_outgoing_message(expected: str, actual: str) -> bool:
     # 微信 UIA 在部分版本上会对长文本、多行文本做轻微归一化或截断。
     # 这里允许“包含关系”命中，避免机器人自己的回复再次触发监听链路。
     shorter, longer = sorted((expected, actual), key=len)
-    if len(shorter) < 12:
+    if len(shorter) < 8:
         return False
     return shorter in longer
 
@@ -876,13 +901,18 @@ class WeChatGroupListener:
             msg_list = _find_message_list(root)
             if not msg_list:
                 raise RuntimeError(f"未找到群聊消息列表: {group}")
-            baseline = _read_visible_items(msg_list)
+            initial_seen = self._bootstrap_initial_seen(msg_list)
             self.sessions[group] = _ListenSession(
                 group=group,
                 hwnd=hwnd,
                 root=root,
                 msg_list=msg_list,
-                seen={item.key for item in baseline},
+                seen=initial_seen,
+            )
+            logger.info(
+                "会话首帧已标记 tail 约 %s 条气泡为已读（重启后不回放历史） group=%s",
+                len(initial_seen),
+                group,
             )
 
     def _read_group_nickname(self, group: str) -> bool:
@@ -934,6 +964,24 @@ class WeChatGroupListener:
             time.sleep(0.2)
         raise RuntimeError(f"等待独立聊天窗口超时: {group}")
 
+    def _bootstrap_initial_seen(self, msg_list) -> Set[Tuple[Tuple[int, ...], str, str]]:
+        """打开独立窗口后先滚到底再采样与 ``_poll_session`` 一致的 tail。
+
+        若不做滚底，首帧 ``seen`` 往往只是列表上半截；下一轮 poll 滚底后尾部历史全会变成「新 key」，
+        导致重启后把旧聊天记录（含机器人自己的长回复）整条当新消息再跑一遍回调。
+        """
+        keys: Set[Tuple[Tuple[int, ...], str, str]] = set()
+        for round_idx in (0, 1):
+            if round_idx == 1:
+                time.sleep(0.04)
+            _try_scroll_message_list_to_end(msg_list)
+            time.sleep(0.06)
+            items = _read_visible_items(msg_list)
+            if self.tail_size > 0:
+                items = items[-self.tail_size :]
+            keys.update(item.key for item in items)
+        return keys
+
     def _run_loop(self) -> None:
         logger.info(f"开始监听群聊: {', '.join(self.groups)}")
         while not self._stop_event.is_set():
@@ -951,6 +999,27 @@ class WeChatGroupListener:
         sessions.sort(key=lambda session: session.next_scan_at)
         return sessions[:self.batch_size]
 
+    def _purge_stale_content_recent(self, session: _ListenSession, now: float) -> None:
+        dq = session.content_recent
+        while dq and dq[0][0] < now - CONTENT_RECENT_TTL_SECONDS:
+            dq.popleft()
+
+    def _is_recent_duplicate_incoming(self, session: _ListenSession, norm: str, now: float) -> bool:
+        if not norm:
+            return False
+        self._purge_stale_content_recent(session, now)
+        cutoff = now - DUPLICATE_CONTENT_SUPPRESS_SECONDS
+        same_count = sum(
+            1 for ts, prev in session.content_recent if prev == norm and ts >= cutoff
+        )
+        return same_count >= MAX_IDENTICAL_CONTENT_EVENTS_PER_WINDOW
+
+    def _note_recent_incoming(self, session: _ListenSession, norm: str, now: float) -> None:
+        if not norm:
+            return
+        self._purge_stale_content_recent(session, now)
+        session.content_recent.append((now, norm))
+
     def _ingest_visible_items(self, session: _ListenSession, items: List[_VisibleItem]) -> int:
         """将本帧 tail 中的新项入队。单轮可入队多条，不限制为一条。
 
@@ -961,17 +1030,27 @@ class WeChatGroupListener:
             tail_key_set = {it.key for it in items}
             session.seen &= tail_key_set
         added = 0
+        now = time.time()
         for item in items:
             if item.key in session.seen:
                 continue
             session.seen.add(item.key)
             if item.kind != "message":
                 continue
+            norm = _normalize_message_text(item.name)
             if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, item.name):
+                continue
+            if norm and self._is_recent_duplicate_incoming(session, norm, now):
+                logger.debug(
+                    "skip duplicate incoming (stable content): group=%s preview=%r",
+                    session.group,
+                    norm[:120],
+                )
                 continue
             added += 1
             session.new_count += 1
             self._enqueue_incoming(session, item)
+            self._note_recent_incoming(session, norm, now)
         return added
 
     def _try_focus_subwindow_for_read(self, session: _ListenSession) -> None:
