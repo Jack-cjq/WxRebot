@@ -55,8 +55,6 @@ DATA_DIR = _resolve_data_dir()
 
 # 发送者解析格式：`昵称: 指令`
 SENDER_PREFIX_RE = re.compile(r"^([^\n:：﹕꞉∶]{1,64})[:：﹕꞉∶]\s*(.+)$")
-# 微信「引用 … 的消息 ：」：前面写算式、冒号后为被引用正文时，拼成「算式+引用段」再按分隔符记账
-WECHAT_QUOTE_INLINE_RE = re.compile(r"^(.+?)引用\s*(.+?)\s*的\s*消息\s*[:：]\s*(.+)$")
 
 
 @dataclass(frozen=True)
@@ -216,6 +214,57 @@ class BookkeepingBot:
 
     _MAX_MULTILINE_COMMANDS = 30
 
+    def _try_plus_one_repeat_command(self, lines: List[str]) -> Optional[str]:
+        """引用一条记账指令后另起一行发「+1」时，从引用区解析出要再执行一次的指令正文。
+
+        UIA 常把引用预览与回复拼成多行：自下而上取第一条可解析为记账指令的行。
+        """
+        if len(lines) < 2:
+            return None
+        last = self._normalize_command_text(lines[-1])
+        if not last or not re.fullmatch(r"[+＋]\s*1", last):
+            return None
+        for line in reversed(lines[:-1]):
+            env = self._extract_command(line, fallback_sender=None)
+            if env:
+                return env.command_text
+        return None
+
+    def _try_plus_one_inline_quoted_command(self, raw: str) -> Optional[str]:
+        """微信引用后回复 +1 时，整行可能合成「+1#<被引用的完整记账指令>」。
+
+        此时应执行内层指令（再记一笔），而不是把「+1#+算式#…」当成一条怪指令。
+        """
+        s = (raw or "").replace("\u2005", " ").replace("\xa0", " ").strip()
+        if not s:
+            return None
+        s = self._merge_wechat_inline_quote(s)
+        s = self._normalize_command_text(s)
+        if not s.startswith("+1"):
+            return None
+        # 避免把 +12、+1.5 等误判为「+1 + 后缀」
+        if len(s) > 2 and s[2] not in " \t#＃$＄":
+            return None
+        rest = s[2:].lstrip()
+        if not rest:
+            return None
+        prefs = self._sorted_record_prefixes()
+        if not prefs:
+            return None
+        inner: Optional[str] = None
+        for p in prefs:
+            if rest.startswith(p):
+                inner = rest[len(p) :].strip()
+                break
+        if inner is None:
+            return None
+        if not inner:
+            return None
+        env = self._extract_command(inner, fallback_sender=None)
+        if not env:
+            return None
+        return env.command_text
+
     def handle(self, event: MessageEvent) -> str:
         text = (event.content or "").strip()
         logger.info(
@@ -227,8 +276,49 @@ class BookkeepingBot:
         if not text:
             return ""
 
-        # 同一条消息内多行连发时，每行按一条独立指令处理，合并为一次回复
         lines = [ln.strip() for ln in re.split(r"\r\n|\n|\r", text) if ln.strip()]
+        # 单行：+1#<被引用完整指令>（微信引用合成一行）
+        inline_repeat = None
+        for probe_inline in lines[:5]:
+            inline_repeat = self._try_plus_one_inline_quoted_command(probe_inline)
+            if inline_repeat:
+                break
+        if inline_repeat:
+            logger.info(
+                "引用 +1 复用指令(单行前缀): group=%s command=%s",
+                event.group,
+                inline_repeat,
+            )
+            sub = MessageEvent(
+                group=event.group,
+                content=inline_repeat,
+                timestamp=event.timestamp,
+                sender=event.sender,
+                group_nickname=event.group_nickname,
+                is_at_me=event.is_at_me,
+                raw=event.raw,
+            )
+            return self._handle_one_message(sub)
+
+        repeat_cmd = self._try_plus_one_repeat_command(lines)
+        if repeat_cmd:
+            logger.info(
+                "引用 +1 复用指令: group=%s command=%s",
+                event.group,
+                repeat_cmd,
+            )
+            sub = MessageEvent(
+                group=event.group,
+                content=repeat_cmd,
+                timestamp=event.timestamp,
+                sender=event.sender,
+                group_nickname=event.group_nickname,
+                is_at_me=event.is_at_me,
+                raw=event.raw,
+            )
+            return self._handle_one_message(sub)
+
+        # 同一条消息内多行连发时，每行按一条独立指令处理，合并为一次回复
         if len(lines) >= 2:
             parts: List[str] = []
             for line in lines[: self._MAX_MULTILINE_COMMANDS]:
@@ -388,34 +478,46 @@ class BookkeepingBot:
             "群聊记账指令说明:\n"
             f"1) 算式{{分隔符}}后缀 — 「分隔符」只能是配置里的记账前缀之一（当前：{delim_hint}）；"
             "机器人回复「当前账单金额」「当前总金额（记后余额）」及拼写结果行\n"
-            f"2) 引用一条消息时可在前面直接写算式，例如：+1213*3.0引用 某人 的消息 ： #后缀（会拼成 +1213*3.0#后缀）\n"
-            f"3) 算式可写在 {prefix} 前或后（如 {prefix}100+20-5 或 100+20-5{prefix}）\n"
-            f"4) {prefix} 收入/支出 金额 分类 [备注]（如 {prefix}支出 18 餐饮 午饭；也可 支出 18 餐饮{prefix}）\n"
-            "5) \\撤回 — 撤回最近一次记账并恢复余额\n"
-            "6) \\查账 — 列出本群全部记账操作记录\n"
-            "7) \\清账 — 清空本群操作记录并将余额归零"
+            f"2) 算式可写在 {prefix} 前或后（如 {prefix}100+20-5 或 100+20-5{prefix}）\n"
+            f"3) {prefix} 收入/支出 金额 分类 [备注]（如 {prefix}支出 18 餐饮 午饭；也可 支出 18 餐饮{prefix}）\n"
+            "4) \\撤回 — 撤回最近一次记账并恢复余额\n"
+            "5) \\查账 — 列出本群全部记账操作记录\n"
+            "6) \\清账 — 清空本群操作记录并将余额归零\n"
+            "7) 引用一条可执行记账指令后回复「+1」：多行时末行 +1；单行时常为「+1#」+ 被引指令全文，会再记一笔\n"
+            "8) 微信 inline 引用：形如「算式引用 昵称 的消息 : #后缀」会合并为「算式#后缀」再解析"
         )
 
-    def _unwrap_wechat_quote_inline(self, text: str) -> str:
-        """将「算式 + 引用 … 的消息 ： + 被引用正文」拼成一条指令再解析。"""
-        s = (text or "").strip()
-        m = WECHAT_QUOTE_INLINE_RE.match(s)
+    def _merge_wechat_inline_quote(self, raw: str) -> str:
+        """微信 PC 常把引用合成一行：算式 + 「引用 xxx 的消息 : 」+ 被引片段（多为 #备注）。
+
+        若不合并，首个 # 会落在被引内容里，左侧会带上中文，导致算式无法通过 MATH_RE。
+        """
+        s = (raw or "").strip()
+        if "引用" not in s or "消息" not in s:
+            return s
+        m = re.match(
+            r"^(.+?)\s*引用\s*.+?\s*的消息\s*[:：︰]\s*(.*)$",
+            s,
+            re.DOTALL,
+        )
         if not m:
-            return text
-        head = m.group(1).strip()
-        tail = m.group(3).strip()
-        if not head or not tail:
-            return text
-        merged = f"{head}{tail}"
-        merged_norm = self._normalize_command_text(merged)
-        merged_norm = self._normalize_record_delimiter_confusables(merged_norm)
-        if merged_norm and self._looks_like_command(merged_norm):
-            return merged
-        return text
+            return s
+        head, tail = m.group(1).strip(), m.group(2).strip()
+        if not head:
+            return s
+        if not tail:
+            return head
+        prefs = self._sorted_record_prefixes()
+        if not prefs:
+            return s
+        for p in prefs:
+            if tail.startswith(p):
+                return f"{head}{tail}"
+        return f"{head}{prefs[0]}{tail}"
 
     def _extract_command(self, text: str, fallback_sender: Optional[str] = None) -> Optional[CommandEnvelope]:
         raw = (text or "").replace("\u2005", " ").replace("\xa0", " ").strip()
-        raw = self._unwrap_wechat_quote_inline(raw)
+        raw = self._merge_wechat_inline_quote(raw)
         sender: Optional[str] = (fallback_sender or "").strip() or None
         command_text = raw
 

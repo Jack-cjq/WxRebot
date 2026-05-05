@@ -34,7 +34,17 @@ from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 列表虚拟化 / RuntimeId 复用时，同一条气泡可能被反复当成「新消息」。
+# 列表虚拟化时，同一条气泡可能被 UIA 短时间反复上报。识别规则（会话内）：
+# 1) 启动采样：滚底后把当前 UIA 可见列表里的消息气泡 ui_key 记入「历史」；
+#    仅当 ui_key 与启动快照一致时才视为历史（不按正文拦截，避免新发的同文案消息被误挡）。
+# 2) ui_key = (RuntimeId, ClassName, Name)，只增不减，避免同一控件反复入队；
+# 3) 仅处理「从当前快照列表底部向上、连续且尚未见过 ui_key」的消息气泡（视为当前最新一段）；
+# 4) 须 ScrollPattern 判定在列表底部，且当前可见尾部与 bottom_anchor_sigs 有交集（补滚动条不准）；
+#    用户上翻时只补 seen、不入队；未在底部时不强行滚底，避免误判为底部。
+# 5) 用户曾进入历史视图后，回到底部的首帧只做 resync（整屏记入 seen/historic + 更新锚点），不入队，
+#    避免虚拟化后旧气泡新 RuntimeId 被当成新消息；可能漏掉浏览历史期间群内新来的消息。
+# 6) 成功入队分配 dispatch_event_id = time.time_ns()（须 >= 会话 boot_monotonic_ns），记入 dispatch_event_ids。
+# 代价：ScrollPattern 恒失败时会退化为「假定在底部」；锚点未建立前不判 history_view；虚拟化边界仍有漏网风险。
 # 在 DUPLICATE_CONTENT_SUPPRESS_SECONDS 窗口内，同一归一化正文最多放行
 # MAX_IDENTICAL_CONTENT_EVENTS_PER_WINDOW 条（含），超过则丢弃——这样同一秒内两人发相同文案仍会各处理一次，
 # 而 UIA 对同一条的多次重复上报多数会在第 3 次起被挡住。
@@ -83,7 +93,25 @@ class _ListenSession:
     root: object
     msg_list: object
     seen: Set[Tuple[Tuple[int, ...], str, str]]
-    """最近已投递处理器的正文（与时间戳），不受 tail 交集裁剪影响，用于抑制 UIA 重复上报。"""
+    """已处理过的 UIA 气泡 key (RuntimeId, ClassName, Name)，会话内只增不减。"""
+    boot_wall_time: float
+    """打开本群监听窗口、开始 bootstrap 采样时的 ``time.time()``。"""
+    boot_monotonic_ns: int
+    """与 boot 同一时刻的 ``time.time_ns()``，用于与 dispatch_event_id 对比。"""
+    bootstrap_completed_wall_time: float
+    """bootstrap 两轮采样结束时的 ``time.time()``；仅在此之后才按「非历史」逻辑入队。"""
+    historic_ui_keys: Set[Tuple[Tuple[int, ...], str, str]]
+    """启动可见快照中的消息气泡 ui_key，视为历史；仅 key 相同才拦截，不按正文去重。"""
+    bottom_anchor_sigs: Deque[Tuple[str, str]]
+    """最近确认在列表底部时见到的消息稳定签名 (class_name, 归一化正文)，用于识别上翻历史视图。"""
+    needs_resync_after_history: bool = field(default=False)
+    """用户曾处于历史视图，回到底部后需先跑一帧「仅同步基线、不入队」。"""
+    history_view_since: float = field(default=0.0)
+    """最近一次进入历史视图的时间；0 表示未在「待重同步」链中。"""
+    last_resync_at: float = field(default=0.0)
+    """最近一次 return-to-bottom resync 的 ``time.time()``。"""
+    dispatch_event_ids: Set[int] = field(default_factory=set)
+    """已成功入队的系统时间型事件 id（time.time_ns()），用于排查与扩展。"""
     content_recent: Deque[Tuple[float, str]] = field(default_factory=lambda: deque(maxlen=500))
     new_count: int = 0
     scan_count: int = 0
@@ -722,6 +750,86 @@ def _read_visible_items(msg_list) -> List[_VisibleItem]:
     return items
 
 
+def _stable_message_signature(item: _VisibleItem) -> Tuple[str, str]:
+    """不依赖 RuntimeId 的气泡签名，用于底部锚点与历史视图推断。"""
+    return item.class_name, _normalize_message_text(item.name)
+
+
+def _is_message_list_at_bottom(msg_list, tolerance: float = 1.0) -> bool:
+    """根据 ScrollPattern 判断是否已滚到列表底部（垂直滚动条接近 100%）。"""
+    try:
+        sc = msg_list.GetScrollPattern()
+    except Exception as exc:
+        logger.debug("GetScrollPattern failed, assume at bottom: %s", exc)
+        return True
+    if not sc:
+        logger.debug("no ScrollPattern on message list, assume at bottom")
+        return True
+    try:
+        if not sc.VerticallyScrollable:
+            return True
+        percent = float(sc.VerticalScrollPercent)
+        return percent >= 100.0 - tolerance
+    except Exception as exc:
+        logger.debug("VerticalScrollPercent read failed, assume at bottom: %s", exc)
+        return True
+
+
+def _update_bottom_anchors(session: _ListenSession, items_full: List[_VisibleItem]) -> None:
+    """在确认处于底部视图时，把当前快照最后几条消息签名记入锚点队列（去重追加）。"""
+    msgs = [it for it in items_full if it.kind == "message"]
+    for it in msgs[-5:]:
+        sig = _stable_message_signature(it)
+        if sig not in session.bottom_anchor_sigs:
+            session.bottom_anchor_sigs.append(sig)
+
+
+def _looks_like_history_view(session: _ListenSession, items_full: List[_VisibleItem]) -> bool:
+    """当前可见尾部与已知底部锚点完全无交集时，推断用户正在看历史区域（补 ScrollPercent 不可靠）。"""
+    msgs = [it for it in items_full if it.kind == "message"]
+    if not msgs:
+        return False
+    if not session.bottom_anchor_sigs:
+        return False
+    current_tail = [_stable_message_signature(it) for it in msgs[-5:]]
+    return not any(sig in session.bottom_anchor_sigs for sig in current_tail)
+
+
+def _mark_visible_items_seen(
+    session: _ListenSession,
+    items_full: List[_VisibleItem],
+) -> int:
+    """将 ``items_full`` 中当前可见项记入 ``seen``；消息气泡同时记入 ``historic_ui_keys``。不入队。
+
+    返回本次新加入 ``seen`` 的 message 气泡 key 数量。
+    """
+    new_message_keys = 0
+    for it in items_full:
+        if it.kind == "message":
+            if it.key not in session.seen:
+                new_message_keys += 1
+            session.seen.add(it.key)
+            session.historic_ui_keys.add(it.key)
+        else:
+            session.seen.add(it.key)
+    return new_message_keys
+
+
+def _contiguous_new_message_suffix_from_bottom(
+    items_full: List[_VisibleItem],
+    seen_ui: Set[Tuple[Tuple[int, ...], str, str]],
+) -> List[_VisibleItem]:
+    """从当前快照中「最后一条消息」往上数，连续未在 seen_ui 中出现过的消息（时间顺序：旧→新）。"""
+    msgs = [it for it in items_full if it.kind == "message"]
+    suffix: List[_VisibleItem] = []
+    for it in reversed(msgs):
+        if it.key in seen_ui:
+            break
+        suffix.append(it)
+    suffix.reverse()
+    return suffix
+
+
 def _find_session_list(root):
     """查找微信左侧会话列表。"""
     try:
@@ -901,17 +1009,33 @@ class WeChatGroupListener:
             msg_list = _find_message_list(root)
             if not msg_list:
                 raise RuntimeError(f"未找到群聊消息列表: {group}")
-            initial_seen = self._bootstrap_initial_seen(msg_list)
+            boot_wall = time.time()
+            boot_ns = time.time_ns()
+            initial_seen, historic_ui, anchor_seed = self._bootstrap_initial_seen(
+                msg_list
+            )
+            bootstrap_done = time.time()
+            bottom_anchors: Deque[Tuple[str, str]] = deque(maxlen=30)
+            for sig in anchor_seed:
+                if sig not in bottom_anchors:
+                    bottom_anchors.append(sig)
             self.sessions[group] = _ListenSession(
                 group=group,
                 hwnd=hwnd,
                 root=root,
                 msg_list=msg_list,
                 seen=initial_seen,
+                boot_wall_time=boot_wall,
+                boot_monotonic_ns=boot_ns,
+                bootstrap_completed_wall_time=bootstrap_done,
+                historic_ui_keys=historic_ui,
+                bottom_anchor_sigs=bottom_anchors,
             )
             logger.info(
-                "会话首帧已标记 tail 约 %s 条气泡为已读（重启后不回放历史） group=%s",
+                "会话启动采样: tail 子项=%s，历史消息气泡 ui_key=%s，底部锚点=%s（group=%s）",
                 len(initial_seen),
+                len(historic_ui),
+                len(bottom_anchors),
                 group,
             )
 
@@ -964,23 +1088,42 @@ class WeChatGroupListener:
             time.sleep(0.2)
         raise RuntimeError(f"等待独立聊天窗口超时: {group}")
 
-    def _bootstrap_initial_seen(self, msg_list) -> Set[Tuple[Tuple[int, ...], str, str]]:
+    def _bootstrap_initial_seen(
+        self, msg_list
+    ) -> Tuple[
+        Set[Tuple[Tuple[int, ...], str, str]],
+        Set[Tuple[Tuple[int, ...], str, str]],
+        List[Tuple[str, str]],
+    ]:
         """打开独立窗口后先滚到底再采样与 ``_poll_session`` 一致的 tail。
 
         若不做滚底，首帧 ``seen`` 往往只是列表上半截；下一轮 poll 滚底后尾部历史全会变成「新 key」，
         导致重启后把旧聊天记录（含机器人自己的长回复）整条当新消息再跑一遍回调。
+
+        同时对当前 UIA **可见**范围内的消息气泡打上历史标记（非完整聊天记录，虚拟列表仅实例化一截）。
         """
-        keys: Set[Tuple[Tuple[int, ...], str, str]] = set()
+        seen_ui: Set[Tuple[Tuple[int, ...], str, str]] = set()
+        historic_ui: Set[Tuple[Tuple[int, ...], str, str]] = set()
+        anchor_seed: List[Tuple[str, str]] = []
         for round_idx in (0, 1):
             if round_idx == 1:
                 time.sleep(0.04)
             _try_scroll_message_list_to_end(msg_list)
             time.sleep(0.06)
-            items = _read_visible_items(msg_list)
-            if self.tail_size > 0:
-                items = items[-self.tail_size :]
-            keys.update(item.key for item in items)
-        return keys
+            items_full = _read_visible_items(msg_list)
+            window = (
+                items_full[-self.tail_size :]
+                if self.tail_size > 0
+                else list(items_full)
+            )
+            seen_ui |= {it.key for it in window}
+            for it in items_full:
+                if it.kind != "message":
+                    continue
+                historic_ui.add(it.key)
+            msgs = [it for it in items_full if it.kind == "message"]
+            anchor_seed = [_stable_message_signature(it) for it in msgs[-5:]]
+        return seen_ui, historic_ui, anchor_seed
 
     def _run_loop(self) -> None:
         logger.info(f"开始监听群聊: {', '.join(self.groups)}")
@@ -1020,25 +1163,90 @@ class WeChatGroupListener:
         self._purge_stale_content_recent(session, now)
         session.content_recent.append((now, norm))
 
-    def _ingest_visible_items(self, session: _ListenSession, items: List[_VisibleItem]) -> int:
-        """将本帧 tail 中的新项入队。单轮可入队多条，不限制为一条。
+    @staticmethod
+    def _allocate_dispatch_event_id(session: _ListenSession) -> int:
+        if len(session.dispatch_event_ids) > 100_000:
+            session.dispatch_event_ids.clear()
+        eid = max(time.time_ns(), session.boot_monotonic_ns)
+        while eid in session.dispatch_event_ids:
+            eid += 1
+        session.dispatch_event_ids.add(eid)
+        return eid
 
-        每帧先把 ``seen`` 与当前 UIA 快照做交集。清账/重绘后旧气泡节点会消失、RuntimeId
-        会复用；若只增不减，新气泡与已删除的旧记录同 (RuntimeId+文本) 时会被整条误判为已见。
+    @staticmethod
+    def _is_bootstrap_historic(session: _ListenSession, item: _VisibleItem) -> bool:
+        """气泡 ui_key 在启动快照或历史同步基线中则视为历史，不入队处理。"""
+        return item.key in session.historic_ui_keys
+
+    def _resync_after_history_view(
+        self,
+        session: _ListenSession,
+        items_full: List[_VisibleItem],
+        reason: str,
+    ) -> None:
+        """从历史上翻回底部后的首帧：只重建 seen/锚点，不触发 on_message。"""
+        new_msg_keys = _mark_visible_items_seen(session, items_full)
+        _update_bottom_anchors(session, items_full)
+        session.needs_resync_after_history = False
+        session.last_resync_at = time.time()
+        msg_count = sum(1 for it in items_full if it.kind == "message")
+        logger.info(
+            "resync after history view, suppress first bottom frame: group=%s reason=%s "
+            "visible_messages=%s new_message_keys_marked=%s seen=%s anchors=%s",
+            session.group,
+            reason,
+            msg_count,
+            new_msg_keys,
+            len(session.seen),
+            len(session.bottom_anchor_sigs),
+        )
+
+    def _ingest_visible_items(
+        self,
+        session: _ListenSession,
+        items_full: List[_VisibleItem],
+        window: List[_VisibleItem],
+    ) -> int:
+        """将本帧中「当前最新一段」新消息入队。
+
+        自列表底部向上连续、且尚未在 ``seen`` 中的消息气泡视为最新一批，整段先记入 ``seen``，
+        再逐条尝试入队；tail 窗口内、但不属于该段的新控件（多为上翻历史）只补 ``seen`` 不入队。
+        命中启动快照「历史」标记（仅 ui_key 与启动时一致）的永不指令入队。
+        每次成功入队分配唯一 ``dispatch_event_id``（``>= boot_monotonic_ns`` 的 ``time.time_ns()``）。
         """
-        if items:
-            tail_key_set = {it.key for it in items}
-            session.seen &= tail_key_set
+        if session.needs_resync_after_history:
+            logger.debug(
+                "ingest suppressed: needs_resync_after_history group=%s",
+                session.group,
+            )
+            return 0
         added = 0
         now = time.time()
-        for item in items:
-            if item.key in session.seen:
+        for it in window:
+            if it.kind != "message":
+                if it.key not in session.seen:
+                    session.seen.add(it.key)
                 continue
-            session.seen.add(item.key)
-            if item.kind != "message":
-                continue
+
+        new_suffix = _contiguous_new_message_suffix_from_bottom(items_full, session.seen)
+        suffix_triples = {
+            (it.runtime_id, it.class_name, it.name) for it in new_suffix
+        }
+        for it in new_suffix:
+            session.seen.add(it.key)
+
+        for item in new_suffix:
             norm = _normalize_message_text(item.name)
-            if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, item.name):
+            if self._is_bootstrap_historic(session, item):
+                logger.debug(
+                    "skip historic-tagged message group=%s preview=%r",
+                    session.group,
+                    norm[:120],
+                )
+                continue
+            if self.ignore_client_sent and self.outgoing_registry.should_ignore(
+                session.group, item.name
+            ):
                 continue
             if norm and self._is_recent_duplicate_incoming(session, norm, now):
                 logger.debug(
@@ -1047,10 +1255,28 @@ class WeChatGroupListener:
                     norm[:120],
                 )
                 continue
+
+            eid = self._allocate_dispatch_event_id(session)
+            logger.debug(
+                "enqueue dispatch_event_id=%s group=%s preview=%r",
+                eid,
+                session.group,
+                norm[:120],
+            )
             added += 1
             session.new_count += 1
             self._enqueue_incoming(session, item)
             self._note_recent_incoming(session, norm, now)
+
+        for it in window:
+            if it.kind != "message":
+                continue
+            triple = (it.runtime_id, it.class_name, it.name)
+            if it.key in session.seen:
+                continue
+            if triple not in suffix_triples:
+                session.seen.add(it.key)
+
         return added
 
     def _try_focus_subwindow_for_read(self, session: _ListenSession) -> None:
@@ -1069,16 +1295,55 @@ class WeChatGroupListener:
         self._try_focus_subwindow_for_read(session)
         added = 0
         try:
+            skip_ingest_for_remaining_rounds = False
             # 两轮采样：首轮滚底+读；短休后无滚动再读，部分情况下 UIA 子树晚一帧才补全
             for round_idx in (0, 1):
+                if skip_ingest_for_remaining_rounds:
+                    continue
                 if round_idx == 1:
                     time.sleep(0.04)
                 if round_idx == 0:
-                    _try_scroll_message_list_to_end(session.msg_list)
-                items = _read_visible_items(session.msg_list)
-                if self.tail_size > 0:
-                    items = items[-self.tail_size:]
-                added += self._ingest_visible_items(session, items)
+                    # 用户已上翻时不要强行滚底，否则 ScrollPercent 恒为底部、误判为可入队
+                    if _is_message_list_at_bottom(session.msg_list):
+                        _try_scroll_message_list_to_end(session.msg_list)
+                at_bottom = _is_message_list_at_bottom(session.msg_list)
+                items_full = _read_visible_items(session.msg_list)
+                window = (
+                    items_full[-self.tail_size :]
+                    if self.tail_size > 0
+                    else list(items_full)
+                )
+                history_view = _looks_like_history_view(session, items_full)
+
+                if not at_bottom or history_view:
+                    session.needs_resync_after_history = True
+                    if session.history_view_since <= 0:
+                        session.history_view_since = time.time()
+                    visible_msg = sum(1 for it in items_full if it.kind == "message")
+                    _mark_visible_items_seen(session, items_full)
+                    logger.info(
+                        "history view detected, suppress ingest and mark visible seen: "
+                        "group=%s at_bottom=%s history_view=%s visible_messages=%s",
+                        session.group,
+                        at_bottom,
+                        history_view,
+                        visible_msg,
+                    )
+                    continue
+
+                if session.needs_resync_after_history:
+                    self._resync_after_history_view(
+                        session,
+                        items_full,
+                        "return_to_bottom_after_history",
+                    )
+                    session.history_view_since = 0.0
+                    skip_ingest_for_remaining_rounds = True
+                    continue
+
+                logger.debug("normal bottom ingest: group=%s", session.group)
+                added += self._ingest_visible_items(session, items_full, window)
+                _update_bottom_anchors(session, items_full)
         except Exception as exc:
             session.fail_count += 1
             logger.debug(f"读取群聊消息失败: {session.group}: {exc}")
