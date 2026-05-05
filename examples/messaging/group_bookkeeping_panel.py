@@ -1,27 +1,15 @@
 # -*- coding: utf-8 -*-
-"""群聊记账机器人控制面板（本地 Web UI）。"""
+"""群聊记账机器人控制面板（本地 Qt 桌面界面）。"""
 
 from __future__ import annotations
 
-import json
 import sys
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from examples.messaging.bookkeeping_config import load_config, save_config, update_runtime
-
-
-HOST = "127.0.0.1"
-PORT = 8966
-
-
-def _split_lines(text: str) -> List[str]:
-    return [item.strip() for item in (text or "").splitlines() if item.strip()]
+from examples.messaging.bookkeeping_config import CONFIG_PATH, load_config, save_config
 
 
 def _split_csv(text: str) -> List[str]:
@@ -32,27 +20,6 @@ def _split_csv(text: str) -> List[str]:
 
 def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     config = load_config()
-
-    config["auto_discover_groups"] = bool(payload.get("auto_discover_groups", True))
-    config["manual_groups"] = _split_lines(str(payload.get("manual_groups_text", "")))
-    config["exclude_groups"] = _split_lines(str(payload.get("exclude_groups_text", "")))
-
-    default_admins = _split_csv(str(payload.get("default_admins_csv", "")))
-    per_group_raw = str(payload.get("per_group_admins_json", "")).strip()
-    per_group = {}
-    if per_group_raw:
-        try:
-            parsed = json.loads(per_group_raw)
-        except Exception:
-            parsed = {}
-        if isinstance(parsed, dict):
-            for group, users in parsed.items():
-                if isinstance(users, list):
-                    per_group[str(group)] = [str(u).strip() for u in users if str(u).strip()]
-
-    merged_admins = {"*": default_admins}
-    merged_admins.update(per_group)
-    config["group_admins"] = merged_admins
 
     command_aliases = dict(config.get("command_aliases") or {})
     command_aliases["help"] = _split_csv(str(payload.get("help_aliases_csv", "")))
@@ -77,26 +44,10 @@ def _append_manual_group(name: str) -> Dict[str, Any]:
     return config
 
 
-def _discover_groups_now() -> List[str]:
-    # 懒加载：避免面板启动阶段就强依赖微信自动化环境。
-    from examples.messaging.group_bookkeeping_bot import discover_groups
-    from src import WeChatClient
-
-    with WeChatClient(auto_connect=True) as wx:
-        return discover_groups(wx)
-
-
 def _to_form_data(config: Dict[str, Any]) -> Dict[str, Any]:
-    group_admins = dict(config.get("group_admins") or {})
-    default_admins = group_admins.pop("*", [])
     command_aliases = dict(config.get("command_aliases") or {})
     runtime = dict(config.get("runtime") or {})
     return {
-        "auto_discover_groups": bool(config.get("auto_discover_groups", True)),
-        "manual_groups_text": "\n".join(config.get("manual_groups") or []),
-        "exclude_groups_text": "\n".join(config.get("exclude_groups") or []),
-        "default_admins_csv": ", ".join(default_admins),
-        "per_group_admins_json": json.dumps(group_admins, ensure_ascii=False, indent=2),
         "help_aliases_csv": ", ".join(command_aliases.get("help") or []),
         "rollback_aliases_csv": ", ".join(command_aliases.get("rollback") or []),
         "bill_aliases_csv": ", ".join(command_aliases.get("bill") or []),
@@ -105,329 +56,211 @@ def _to_form_data(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-class PanelHandler(BaseHTTPRequestHandler):
-    def _json_response(self, data: Dict[str, Any], code: int = HTTPStatus.OK) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def _fill_list_widget(widget: Any, items: List[str]) -> None:
+    widget.clear()
+    if items:
+        widget.addItems(items)
+    else:
+        widget.addItem("暂无")
 
-    def _read_json(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length else b"{}"
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
 
-    def do_GET(self) -> None:  # noqa: N802
-        route = urlparse(self.path).path
-        if route == "/":
-            page = _render_html()
-            data = page.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
+class BookkeepingPanelWindow:
+    def __init__(self) -> None:
+        from PySide6.QtWidgets import (
+            QFormLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QListWidget,
+            QMainWindow,
+            QMessageBox,
+            QPushButton,
+            QScrollArea,
+            QSizePolicy,
+            QVBoxLayout,
+            QWidget,
+        )
 
-        if route == "/api/config":
+        self._win = QMainWindow()
+        self._win.setWindowTitle("微信群记账机器人控制面板")
+        self._win.resize(920, 680)
+
+        central = QWidget()
+        root = QVBoxLayout(central)
+
+        title = QLabel("微信群记账机器人控制面板")
+        f = title.font()
+        f.setPointSize(f.pointSize() + 4)
+        f.setBold(True)
+        title.setFont(f)
+        root.addWidget(title)
+
+        path_hint = QLabel(f"配置文件：{CONFIG_PATH}")
+        path_hint.setStyleSheet("color: #64748b; font-size: 12px;")
+        path_hint.setWordWrap(True)
+        root.addWidget(path_hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        cols = QHBoxLayout(scroll_content)
+
+        left_col = QVBoxLayout()
+        right_col = QVBoxLayout()
+
+        # --- 监听状态（仅当前已监听 + 添加） ---
+        gb_listen = QGroupBox("监听状态")
+        gl = QVBoxLayout(gb_listen)
+        gl.addWidget(QLabel("当前已监听的群（由机器人写入，重新加载可刷新）"))
+        self._listening = QListWidget()
+        self._listening.setMinimumHeight(200)
+        gl.addWidget(self._listening)
+
+        row_add = QHBoxLayout()
+        self._add_group_name = QLineEdit()
+        self._add_group_name.setPlaceholderText("输入群聊名称")
+        btn_add = QPushButton("添加监听")
+        btn_add.clicked.connect(self._on_add_listen)
+        row_add.addWidget(self._add_group_name)
+        row_add.addWidget(btn_add)
+        gl.addLayout(row_add)
+
+        left_col.addWidget(gb_listen)
+
+        # --- 指令触发词 ---
+        gb_cmd = QGroupBox("指令触发词")
+        gc = QFormLayout(gb_cmd)
+        self._help_aliases = QLineEdit()
+        self._rollback_aliases = QLineEdit()
+        self._bill_aliases = QLineEdit()
+        self._record_prefix = QLineEdit()
+        gc.addRow("帮助指令（逗号分隔）", self._help_aliases)
+        gc.addRow("撤销指令（逗号分隔）", self._rollback_aliases)
+        gc.addRow("账单指令前缀（逗号分隔）", self._bill_aliases)
+        gc.addRow("记账前缀（逗号分隔）", self._record_prefix)
+        hint_rp = QLabel(
+            "记账前缀不能仅为四则运算符 +、-、*、/。\n"
+            "「算式 + 分隔符 + 后缀」里的分隔符必须是上面配置的某一个前缀（可多选逗号分隔），"
+            "例如配置了 # 则用 +1200*5.8#备注。"
+        )
+        hint_rp.setStyleSheet("color: #64748b; font-size: 12px;")
+        hint_rp.setWordWrap(True)
+        gc.addRow(hint_rp)
+
+        right_col.addWidget(gb_cmd)
+
+        # --- 操作 ---
+        gb_ops = QGroupBox("操作")
+        go = QVBoxLayout(gb_ops)
+        row_btn = QHBoxLayout()
+        btn_save = QPushButton("保存配置")
+        btn_save.clicked.connect(self._on_save)
+        btn_reload = QPushButton("重新加载")
+        btn_reload.clicked.connect(self._load_into_ui)
+        row_btn.addWidget(btn_save)
+        row_btn.addWidget(btn_reload)
+        row_btn.addStretch()
+        go.addLayout(row_btn)
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("color: #15803d; font-size: 13px;")
+        go.addWidget(self._status)
+
+        right_col.addWidget(gb_ops)
+        right_col.addStretch()
+
+        left_w = QWidget()
+        left_w.setLayout(left_col)
+        left_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        right_w = QWidget()
+        right_w.setLayout(right_col)
+        right_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        cols.addWidget(left_w, 1)
+        cols.addWidget(right_w, 1)
+        scroll.setWidget(scroll_content)
+        root.addWidget(scroll, 1)
+
+        self._win.setCentralWidget(central)
+
+    def _set_status(self, text: str, *, error: bool = False) -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(
+            "color: #b91c1c; font-size: 13px;" if error else "color: #15803d; font-size: 13px;"
+        )
+
+    def _load_into_ui(self) -> None:
+        try:
             config = load_config()
-            self._json_response({"ok": True, "data": _to_form_data(config)})
+            d = _to_form_data(config)
+        except Exception as exc:
+            self._set_status(f"读取配置失败：{exc}", error=True)
             return
 
-        self._json_response({"ok": False, "error": "Not Found"}, code=HTTPStatus.NOT_FOUND)
+        rt = d.get("runtime") or {}
+        _fill_list_widget(self._listening, list(rt.get("current_listening_groups") or []))
 
-    def do_POST(self) -> None:  # noqa: N802
-        route = urlparse(self.path).path
-        if route == "/api/config":
-            try:
-                payload = self._read_json()
-                config = _normalize_payload(payload)
-                save_config(config)
-                self._json_response({"ok": True, "data": _to_form_data(config)})
-            except Exception as exc:
-                self._json_response({"ok": False, "error": str(exc)}, code=HTTPStatus.BAD_REQUEST)
+        self._help_aliases.setText(str(d.get("help_aliases_csv") or ""))
+        self._rollback_aliases.setText(str(d.get("rollback_aliases_csv") or ""))
+        self._bill_aliases.setText(str(d.get("bill_aliases_csv") or ""))
+        self._record_prefix.setText(str(d.get("record_prefix_csv") or ""))
+        self._set_status("配置已加载")
+
+    def _payload_from_ui(self) -> Dict[str, Any]:
+        return {
+            "help_aliases_csv": self._help_aliases.text(),
+            "rollback_aliases_csv": self._rollback_aliases.text(),
+            "bill_aliases_csv": self._bill_aliases.text(),
+            "record_prefix_csv": self._record_prefix.text(),
+        }
+
+    def _on_save(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        try:
+            config = _normalize_payload(self._payload_from_ui())
+            save_config(config)
+        except Exception as exc:
+            self._set_status(str(exc), error=True)
+            QMessageBox.warning(self._win, "保存失败", str(exc))
             return
+        self._set_status("配置已保存")
+        self._load_into_ui()
 
-        if route == "/api/discover-groups":
-            try:
-                groups = _discover_groups_now()
-                update_runtime(last_discovered_groups=groups)
-                config = load_config()
-                self._json_response({"ok": True, "groups": groups, "data": _to_form_data(config)})
-            except Exception as exc:
-                self._json_response({"ok": False, "error": str(exc)}, code=HTTPStatus.BAD_REQUEST)
+    def _on_add_listen(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        name = self._add_group_name.text().strip()
+        if not name:
+            self._set_status("请先输入群聊名称", error=True)
             return
-
-        if route == "/api/manual-groups/add":
-            try:
-                payload = self._read_json()
-                config = _append_manual_group(str(payload.get("group_name", "")))
-                self._json_response({"ok": True, "data": _to_form_data(config)})
-            except Exception as exc:
-                self._json_response({"ok": False, "error": str(exc)}, code=HTTPStatus.BAD_REQUEST)
+        try:
+            _append_manual_group(name)
+        except Exception as exc:
+            self._set_status(str(exc), error=True)
+            QMessageBox.warning(self._win, "添加失败", str(exc))
             return
+        self._add_group_name.clear()
+        self._set_status("已添加监听，机器人将自动重载")
+        self._load_into_ui()
 
-        self._json_response({"ok": False, "error": "Not Found"}, code=HTTPStatus.NOT_FOUND)
-
-    def log_message(self, format: str, *args) -> None:  # noqa: A003
-        return
-
-
-def _render_html() -> str:
-    return """<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>微信群记账机器人控制面板</title>
-  <style>
-    :root { --bg:#f4f6fb; --card:#ffffff; --text:#1f2937; --muted:#6b7280; --line:#dbe1ea; --accent:#0f766e; --btn:#0ea5a4; --btn2:#2563eb; }
-    * { box-sizing:border-box; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
-    body { margin:0; background:linear-gradient(120deg,#f7fafc,#edf2f7 60%,#e6fffa); color:var(--text); }
-    .wrap { max-width:1100px; margin:24px auto; padding:0 16px; }
-    .title { font-size:24px; font-weight:700; margin-bottom:12px; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; box-shadow:0 8px 24px rgba(15,23,42,.05); }
-    .card h3 { margin:0 0 10px; font-size:16px; }
-    .muted { color:var(--muted); font-size:13px; }
-    .row { margin-bottom:10px; }
-    label { display:block; font-size:13px; margin-bottom:6px; color:#334155; }
-    textarea,input[type=text] { width:100%; border:1px solid #cbd5e1; border-radius:8px; padding:8px; font-size:13px; background:#fff; }
-    textarea { min-height:90px; resize:vertical; }
-    .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    button { border:none; border-radius:8px; padding:9px 14px; color:#fff; cursor:pointer; font-size:13px; }
-    .primary { background:var(--btn); }
-    .secondary { background:var(--btn2); }
-    .status { margin-top:10px; font-size:13px; color:#0f5132; }
-    ul { margin:8px 0 0 18px; padding:0; }
-    @media (max-width: 860px) { .grid { grid-template-columns:1fr; } }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="title">微信群记账机器人控制面板</div>
-    <div class="muted">所有配置写入同一个 JSON 文件：<code>examples/messaging/group_bookkeeping_config.json</code></div>
-    <div class="grid">
-      <section class="card">
-        <h3>监听状态</h3>
-        <div class="muted">当前已监听群聊（由机器人进程写入）</div>
-        <ul id="listeningGroups"></ul>
-        <div class="muted" style="margin-top:8px;">计划监听群聊（含手动添加）</div>
-        <ul id="desiredGroups"></ul>
-        <div class="muted" style="margin-top:8px;">最近发现的群</div>
-        <ul id="discoveredGroups"></ul>
-        <div class="row" style="margin-top:10px;">
-          <label><input id="autoDiscover" type="checkbox" /> 自动发现群聊</label>
-        </div>
-        <div class="row">
-          <label>手动补充监听群（每行一个）</label>
-          <textarea id="manualGroups"></textarea>
-        </div>
-        <div class="row">
-          <label>快速添加单个群聊</label>
-          <div class="btns">
-            <input id="quickGroupName" type="text" placeholder="输入群聊名称，例如：项目群A" />
-            <button class="secondary" onclick="addManualGroup()">加入手动监听</button>
-          </div>
-        </div>
-        <div class="row">
-          <label>排除群（每行一个）</label>
-          <textarea id="excludeGroups"></textarea>
-        </div>
-      </section>
-
-      <section class="card">
-        <h3>白名单配置</h3>
-        <div class="row">
-          <label>全局白名单（逗号分隔）</label>
-          <input id="defaultAdmins" type="text" />
-        </div>
-        <div class="row">
-          <label>按群白名单（JSON，键=群名，值=用户名数组）</label>
-          <textarea id="perGroupAdmins"></textarea>
-        </div>
-        <div class="muted">
-          示例：
-          <pre style="margin:6px 0 0; padding:8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; overflow:auto;">{
-  "项目群A": ["王五", "赵六"],
-  "财务群": ["小李"]
-}</pre>
-        </div>
-        <div class="muted">消息需满足“发送者: 指令”并命中白名单。</div>
-      </section>
-
-      <section class="card">
-        <h3>指令触发词</h3>
-        <div class="row">
-          <label>帮助指令（逗号分隔）</label>
-          <input id="helpAliases" type="text" />
-        </div>
-        <div class="row">
-          <label>撤销指令（逗号分隔）</label>
-          <input id="rollbackAliases" type="text" />
-        </div>
-        <div class="row">
-          <label>账单指令前缀（逗号分隔）</label>
-          <input id="billAliases" type="text" />
-        </div>
-        <div class="row">
-          <label>记账前缀（逗号分隔）</label>
-          <input id="recordPrefix" type="text" />
-          <div class="muted" style="margin-top:6px;">不能纯为四则运算符 +、-、*、/；保存时若不符合将拒绝写入。</div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h3>操作</h3>
-        <div class="btns">
-          <button class="primary" onclick="saveConfig()">保存配置</button>
-          <button class="secondary" onclick="discoverGroups()">刷新发现群聊</button>
-          <button class="secondary" onclick="loadConfig()">重新加载</button>
-        </div>
-        <div id="status" class="status"></div>
-      </section>
-    </div>
-  </div>
-  <script>
-    const ids = {
-      autoDiscover: document.getElementById('autoDiscover'),
-      manualGroups: document.getElementById('manualGroups'),
-      quickGroupName: document.getElementById('quickGroupName'),
-      excludeGroups: document.getElementById('excludeGroups'),
-      defaultAdmins: document.getElementById('defaultAdmins'),
-      perGroupAdmins: document.getElementById('perGroupAdmins'),
-      helpAliases: document.getElementById('helpAliases'),
-      rollbackAliases: document.getElementById('rollbackAliases'),
-      billAliases: document.getElementById('billAliases'),
-      recordPrefix: document.getElementById('recordPrefix'),
-      listeningGroups: document.getElementById('listeningGroups'),
-      desiredGroups: document.getElementById('desiredGroups'),
-      discoveredGroups: document.getElementById('discoveredGroups'),
-      status: document.getElementById('status'),
-    };
-
-    function setStatus(text, isError=false) {
-      ids.status.textContent = text;
-      ids.status.style.color = isError ? '#b91c1c' : '#0f5132';
-    }
-
-    function renderList(ul, arr) {
-      ul.innerHTML = '';
-      (arr || []).forEach(item => {
-        const li = document.createElement('li');
-        li.textContent = item;
-        ul.appendChild(li);
-      });
-      if (!arr || !arr.length) {
-        const li = document.createElement('li');
-        li.textContent = '暂无';
-        ul.appendChild(li);
-      }
-    }
-
-    async function loadConfig() {
-      const res = await fetch('/api/config');
-      const json = await res.json();
-      if (!json.ok) {
-        setStatus(json.error || '读取配置失败', true);
-        return;
-      }
-      const d = json.data;
-      ids.autoDiscover.checked = !!d.auto_discover_groups;
-      ids.manualGroups.value = d.manual_groups_text || '';
-      ids.excludeGroups.value = d.exclude_groups_text || '';
-      ids.defaultAdmins.value = d.default_admins_csv || '';
-      ids.perGroupAdmins.value = d.per_group_admins_json || '{}';
-      ids.helpAliases.value = d.help_aliases_csv || '';
-      ids.rollbackAliases.value = d.rollback_aliases_csv || '';
-      ids.billAliases.value = d.bill_aliases_csv || '';
-      ids.recordPrefix.value = d.record_prefix_csv || '';
-      renderList(ids.listeningGroups, d.runtime?.current_listening_groups || []);
-      renderList(ids.desiredGroups, d.runtime?.desired_listening_groups || []);
-      renderList(ids.discoveredGroups, d.runtime?.last_discovered_groups || []);
-      setStatus('配置已加载');
-    }
-
-    async function saveConfig() {
-      const payload = {
-        auto_discover_groups: ids.autoDiscover.checked,
-        manual_groups_text: ids.manualGroups.value,
-        exclude_groups_text: ids.excludeGroups.value,
-        default_admins_csv: ids.defaultAdmins.value,
-        per_group_admins_json: ids.perGroupAdmins.value,
-        help_aliases_csv: ids.helpAliases.value,
-        rollback_aliases_csv: ids.rollbackAliases.value,
-        bill_aliases_csv: ids.billAliases.value,
-        record_prefix_csv: ids.recordPrefix.value,
-      };
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (!json.ok) {
-        setStatus(json.error || '保存失败', true);
-        return;
-      }
-      setStatus('配置已保存');
-      await loadConfig();
-    }
-
-    async function discoverGroups() {
-      setStatus('正在发现群聊，请稍候...');
-      const res = await fetch('/api/discover-groups', { method: 'POST' });
-      const json = await res.json();
-      if (!json.ok) {
-        setStatus(json.error || '发现群聊失败', true);
-        return;
-      }
-      setStatus('已刷新发现群聊');
-      await loadConfig();
-    }
-
-    async function addManualGroup() {
-      const name = (ids.quickGroupName.value || '').trim();
-      if (!name) {
-        setStatus('请先输入群聊名称', true);
-        return;
-      }
-      const res = await fetch('/api/manual-groups/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ group_name: name }),
-      });
-      const json = await res.json();
-      if (!json.ok) {
-        setStatus(json.error || '添加失败', true);
-        return;
-      }
-      ids.quickGroupName.value = '';
-      setStatus('已加入手动监听，机器人将自动重载');
-      await loadConfig();
-    }
-
-    loadConfig();
-  </script>
-</body>
-</html>
-"""
+    def show(self) -> None:
+        self._load_into_ui()
+        self._win.show()
 
 
 def main() -> None:
-    server = ThreadingHTTPServer((HOST, PORT), PanelHandler)
-    print(f"控制面板已启动: http://{HOST}:{PORT}")
-    print("按 Ctrl+C 停止")
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        print("未安装 PySide6，请先执行：pip install PySide6")
+        sys.exit(1)
+
+    app = QApplication(sys.argv)
+    panel = BookkeepingPanelWindow()
+    panel.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

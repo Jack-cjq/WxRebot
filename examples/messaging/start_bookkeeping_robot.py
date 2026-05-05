@@ -6,14 +6,12 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
-import webbrowser
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 PANEL_SCRIPT = ROOT / "group_bookkeeping_panel.py"
 BOT_SCRIPT = ROOT / "group_bookkeeping_bot.py"
-PANEL_URL = "http://127.0.0.1:8966"
 
 
 def _spawn(cmd: list[str]) -> subprocess.Popen:
@@ -23,16 +21,11 @@ def _spawn(cmd: list[str]) -> subprocess.Popen:
 def main() -> None:
     python = sys.executable
 
-    print("启动控制面板...")
+    print("启动控制面板（Qt 窗口）...")
     panel_proc = _spawn([python, str(PANEL_SCRIPT)])
-    time.sleep(1.2)
+    time.sleep(0.8)
 
-    try:
-        webbrowser.open(PANEL_URL)
-    except Exception:
-        pass
-
-    print(f"控制面板地址: {PANEL_URL}")
+    print("若未看到窗口，请确认已安装 PySide6：pip install PySide6")
     print("启动群聊监听机器人...")
     bot_proc = _spawn([python, str(BOT_SCRIPT)])
 

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha1
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -55,6 +55,8 @@ DATA_DIR = _resolve_data_dir()
 
 # 发送者解析格式：`昵称: 指令`
 SENDER_PREFIX_RE = re.compile(r"^([^\n:：﹕꞉∶]{1,64})[:：﹕꞉∶]\s*(.+)$")
+# 微信「引用 … 的消息 ：」：前面写算式、冒号后为被引用正文时，拼成「算式+引用段」再按分隔符记账
+WECHAT_QUOTE_INLINE_RE = re.compile(r"^(.+?)引用\s*(.+?)\s*的\s*消息\s*[:：]\s*(.+)$")
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,8 @@ class BookkeepingBot:
     )
     BILL_RE = re.compile(r"^账单(?:\s+(今日|本月|全部))?$")
     MATH_RE = re.compile(r"^[\d\.\+\-\*/\(\)\s]+$")
+    # 机器人回复第二行形如「+1200*5.8=6960$后缀」；「=金额」不在合法算式字符集内，需剥离且勿重复入账
+    _ECHO_EQUALS_SUFFIX_RE = re.compile(r"^(.+?)=(\d+(?:\.\d+)?)$")
     # More tolerant add-command parser (less strict about spaces).
     ADD_RE_RELAXED = re.compile(
         r"^(?:\u8bb0\u8d26\s*)?(\u6536\u5165|\u652f\u51fa)\s*([0-9]+(?:\.[0-9]{1,2})?)(?:\s+(\S+))?(?:\s+(.+))?$"
@@ -274,6 +278,43 @@ class BookkeepingBot:
         if period:
             return self._summary(event.group, period)
 
+        delimited = self._parse_delimited_math_record(envelope.command_text)
+        if delimited is not None:
+            expr, suffix, delim, is_echo_line = delimited
+            if is_echo_line:
+                return (
+                    "这是记账结果的展示格式（含「=金额」），不会重复入账。\n"
+                    f"请发原始指令：算式{delim}后缀，例如 +1200*5.8{delim}备注"
+                    "（勿复制机器人回复里带「=金额」的那一行）。"
+                )
+            calc = self._calculate_if_expression(expr)
+            if calc is None:
+                return ""
+            if calc == "错误:除数为0":
+                return "计算失败: 除数不能为 0"
+            delta = float(calc)
+            balance = self._apply_group_delta(event.group, delta)
+            self._append_group_operation(
+                event.group,
+                {
+                    "kind": "math_hash",
+                    "timestamp": float(event.timestamp or time.time()),
+                    "command": envelope.command_text,
+                    "expression": expr,
+                    "suffix": suffix,
+                    "delimiter": delim,
+                    "delta": delta,
+                    "balance_after": balance,
+                },
+            )
+            detail = f"{expr}={calc}{delim}{suffix}" if suffix else f"{expr}={calc}{delim}"
+            total_txt = self._format_number(balance)
+            return (
+                f"当前账单金额: {calc}\n"
+                f"当前总金额: {total_txt}\n"
+                f"{detail}"
+            )
+
         math_expr = self._extract_record_math_expression(envelope.command_text)
         if math_expr is not None:
             calc = self._calculate_if_expression(math_expr)
@@ -342,17 +383,39 @@ class BookkeepingBot:
     def _help_text(self) -> str:
         prefixes = self._command_aliases.get("record_prefix", ["$"])
         prefix = prefixes[0] if prefixes else "$"
+        delim_hint = "、".join(self._sorted_record_prefixes()) or prefix
         return (
             "群聊记账指令说明:\n"
-            f"1) 算式可写在 {prefix} 前或后（如 {prefix}100+20-5 或 100+20-5{prefix}）\n"
-            f"2) {prefix} 收入/支出 金额 分类 [备注]（如 {prefix}支出 18 餐饮 午饭；也可 支出 18 餐饮{prefix}）\n"
-            "3) \\撤回 — 撤回最近一次记账并恢复余额\n"
-            "4) \\查账 — 列出本群全部记账操作记录\n"
-            "5) \\清账 — 清空本群操作记录并将余额归零"
+            f"1) 算式{{分隔符}}后缀 — 「分隔符」只能是配置里的记账前缀之一（当前：{delim_hint}）；"
+            "机器人回复「当前账单金额」「当前总金额（记后余额）」及拼写结果行\n"
+            f"2) 引用一条消息时可在前面直接写算式，例如：+1213*3.0引用 某人 的消息 ： #后缀（会拼成 +1213*3.0#后缀）\n"
+            f"3) 算式可写在 {prefix} 前或后（如 {prefix}100+20-5 或 100+20-5{prefix}）\n"
+            f"4) {prefix} 收入/支出 金额 分类 [备注]（如 {prefix}支出 18 餐饮 午饭；也可 支出 18 餐饮{prefix}）\n"
+            "5) \\撤回 — 撤回最近一次记账并恢复余额\n"
+            "6) \\查账 — 列出本群全部记账操作记录\n"
+            "7) \\清账 — 清空本群操作记录并将余额归零"
         )
+
+    def _unwrap_wechat_quote_inline(self, text: str) -> str:
+        """将「算式 + 引用 … 的消息 ： + 被引用正文」拼成一条指令再解析。"""
+        s = (text or "").strip()
+        m = WECHAT_QUOTE_INLINE_RE.match(s)
+        if not m:
+            return text
+        head = m.group(1).strip()
+        tail = m.group(3).strip()
+        if not head or not tail:
+            return text
+        merged = f"{head}{tail}"
+        merged_norm = self._normalize_command_text(merged)
+        merged_norm = self._normalize_record_delimiter_confusables(merged_norm)
+        if merged_norm and self._looks_like_command(merged_norm):
+            return merged
+        return text
 
     def _extract_command(self, text: str, fallback_sender: Optional[str] = None) -> Optional[CommandEnvelope]:
         raw = (text or "").replace("\u2005", " ").replace("\xa0", " ").strip()
+        raw = self._unwrap_wechat_quote_inline(raw)
         sender: Optional[str] = (fallback_sender or "").strip() or None
         command_text = raw
 
@@ -373,6 +436,7 @@ class BookkeepingBot:
                     break
 
         command_text = self._normalize_command_text(command_text)
+        command_text = self._normalize_record_delimiter_confusables(command_text)
         if not command_text:
             return None
         if not self._looks_like_command(command_text):
@@ -402,6 +466,23 @@ class BookkeepingBot:
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
+    def _normalize_record_delimiter_confusables(self, text: str) -> str:
+        """按已配置的记账前缀，把常见全角/变体符号还原成 ASCII，便于 split 命中。"""
+        s = text or ""
+        prefs = set(self._sorted_record_prefixes())
+        if not prefs:
+            return s
+        pairs: List[Tuple[str, str]] = []
+        if "$" in prefs:
+            pairs.append(("＄", "$"))
+            pairs.append(("\ufe69", "$"))
+        if "#" in prefs:
+            pairs.append(("＃", "#"))
+        for old, new in pairs:
+            if old in s:
+                s = s.replace(old, new)
+        return s
+
     def _looks_like_command(self, text: str) -> bool:
         if self._is_operator_only_command_text(text):
             return False
@@ -414,6 +495,8 @@ class BookkeepingBot:
         if self._is_clear_command(text):
             return True
         if self._match_bill_command(text):
+            return True
+        if self._parse_delimited_math_record(text) is not None:
             return True
         if self._extract_record_math_expression(text) is not None:
             return True
@@ -453,6 +536,55 @@ class BookkeepingBot:
             expr = payload[: -len(prefix)].strip()
             if expr and self._is_math_expression(expr):
                 return expr
+        return None
+
+    def _strip_echo_equals_amount(self, expr_side: str) -> Tuple[str, bool]:
+        """若形如「纯算式=数字」且数字与算式结果一致，视为复制了机器人回复，返回左侧算式及 True。"""
+        s = (expr_side or "").strip()
+        m = BookkeepingBot._ECHO_EQUALS_SUFFIX_RE.match(s)
+        if not m:
+            return s, False
+        left, right_txt = m.group(1).strip(), m.group(2)
+        calc = self._calculate_if_expression(left)
+        if calc is None or calc == "错误:除数为0":
+            return s, False
+        try:
+            if abs(float(calc) - float(right_txt)) > 1e-6:
+                return s, False
+        except ValueError:
+            return s, False
+        return left, True
+
+    def _parse_delimited_math_record(self, text: str) -> Optional[Tuple[str, str, str, bool]]:
+        """`算式{记账前缀}后缀`：分隔符必须与配置中的 record_prefix 某项一致，算式结果计入本群余额。
+
+        第四项为 True 表示文本里含「=金额」结果行（复制机器人回复），只提示、不入账。
+        """
+        s = (text or "").strip()
+
+        def try_sep(sep: str) -> Optional[Tuple[str, str, str, bool]]:
+            if sep not in s:
+                return None
+            expr, suffix = s.split(sep, 1)
+            expr = expr.strip()
+            suffix = suffix.strip()
+            if not expr:
+                return None
+            expr, is_echo = self._strip_echo_equals_amount(expr)
+            if not self.MATH_RE.match(expr):
+                return None
+            if not any(ch in expr for ch in "+-*/"):
+                return None
+            if self._calculate_if_expression(expr) is None:
+                return None
+            return (expr, suffix, sep, is_echo)
+
+        for p in self._sorted_record_prefixes():
+            if not p:
+                continue
+            hit = try_sep(p)
+            if hit:
+                return hit
         return None
 
     def _extract_record_math_expression(self, text: str) -> Optional[str]:
@@ -676,8 +808,15 @@ class BookkeepingBot:
                     + f" | 变动: {delta} | 记后余额: {bal}"
                 )
             else:
-                expr = str(op.get("expression", "") or op.get("command", ""))
-                line = f"{idx}. {when} {expr} = {delta} | 记后余额: {bal}"
+                if kind == "math_hash":
+                    expr_h = str(op.get("expression", "") or "")
+                    suf_h = str(op.get("suffix", "") or "")
+                    dlm = str(op.get("delimiter", "") or "#")
+                    shown = f"{expr_h}{dlm}{suf_h}" if suf_h else f"{expr_h}{dlm}"
+                    line = f"{idx}. {when} {shown} = {delta} | 记后余额: {bal}"
+                else:
+                    expr = str(op.get("expression", "") or op.get("command", ""))
+                    line = f"{idx}. {when} {expr} = {delta} | 记后余额: {bal}"
             lines.append(line)
         original_balance = balance - total_change
         return (
