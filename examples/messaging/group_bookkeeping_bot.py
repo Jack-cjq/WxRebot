@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-r"""微信群聊记账机器人（自动发现群 + 指令控制）。
+r"""微信群聊记账机器人（配置监听群 + 指令控制）。
 
 启动目标：
-1. 自动发现当前微信左侧会话里的群聊并监听。
+1. 打开配置文件里已监控的群聊并监听。
 2. 检测到记账指令后自动回复并执行。
 3. 每个群单独记账。
 注意：
@@ -1155,25 +1155,15 @@ def discover_groups(wx: WeChatClient) -> List[str]:
     exclude_groups = set(config.get("exclude_groups") or [])
     root = wx.window.uia.root
     candidates = _collect_session_names(root)
-    groups: List[str] = []
-    for name in candidates:
-        if name in exclude_groups:
-            continue
-        if _is_group_candidate(wx, name):
-            groups.append(name)
-    return list(dict.fromkeys(groups))
+    return list(dict.fromkeys(name for name in candidates if name and name not in exclude_groups))
 
 
-def resolve_listen_groups(wx: WeChatClient, discovered_groups: Optional[List[str]] = None) -> List[str]:
+def resolve_listen_groups() -> List[str]:
     config = load_config()
-    auto_discover_groups = bool(config.get("auto_discover_groups", True))
     manual_groups = list(config.get("manual_groups") or [])
     exclude_groups = set(config.get("exclude_groups") or [])
 
-    groups: List[str] = []
-    if auto_discover_groups:
-        groups.extend(discovered_groups if discovered_groups is not None else discover_groups(wx))
-    groups.extend(manual_groups)
+    groups: List[str] = list(manual_groups)
     groups = [group for group in dict.fromkeys(groups) if group and group not in exclude_groups]
     return groups
 
@@ -1189,10 +1179,8 @@ def main() -> None:
         notified_waiting = False
         active_processor = None
         active_groups: List[str] = []
-        last_discovered_groups: List[str] = []
-        last_discover_at = 0.0
-        temporary_unavailable_groups: Dict[str, float] = {}
-        unavailable_cooldown_seconds = 60
+        failed_target_signature = ""
+        last_listen_query_requested_at = 0.0
         last_acl_signature = json.dumps(
             {
                 "command_aliases": initial_config.get("command_aliases") or {},
@@ -1204,8 +1192,8 @@ def main() -> None:
         print("记账机器人已启动，将持续监听配置变化。")
         print(f"账本目录: {DATA_DIR}")
         print("权限模式: 无白名单，符合指令格式即可触发。")
-        print("提示：可在控制面板填写 manual_groups，机器人会自动重载监听。")
-        print(f"自动发现群聊: {'开启' if bool(load_config().get('auto_discover_groups', False)) else '关闭'}")
+        print("提示：机器人启动时只打开配置文件 manual_groups 中已监控的群聊。")
+        print("如需查找新群，请在控制面板点击监听查询。")
 
         try:
             while True:
@@ -1225,41 +1213,23 @@ def main() -> None:
                     print("检测到指令配置变更，已热更新。")
                     reload_handler_required = True
 
-                auto_discover = bool(runtime_config.get("auto_discover_groups", True))
-                discover_interval_seconds = int(runtime_config.get("discover_interval_seconds", 60) or 60)
-                discover_interval_seconds = max(10, discover_interval_seconds)
-
-                now = time.time()
-                need_discover = (
-                    auto_discover
-                    and (
-                        not last_discovered_groups
-                        or not active_groups
-                        or (now - last_discover_at) >= discover_interval_seconds
+                runtime = dict(runtime_config.get("runtime") or {})
+                try:
+                    listen_query_requested_at = float(
+                        runtime.get("listen_query_requested_at", 0.0) or 0.0
                     )
-                )
+                except Exception:
+                    listen_query_requested_at = 0.0
+                if listen_query_requested_at != last_listen_query_requested_at:
+                    last_listen_query_requested_at = listen_query_requested_at
+                    failed_target_signature = ""
 
-                if need_discover:
-                    last_discovered_groups = discover_groups(wx)
-                    last_discover_at = now
-
-                discovered_groups = list(last_discovered_groups) if auto_discover else []
-                target_groups = resolve_listen_groups(wx, discovered_groups=discovered_groups)
-
-                # 清理已过冷却时间的临时不可用群
-                for group, retry_after in list(temporary_unavailable_groups.items()):
-                    if now >= retry_after:
-                        temporary_unavailable_groups.pop(group, None)
-
-                target_groups = [
-                    group for group in target_groups
-                    if group not in temporary_unavailable_groups
-                ]
+                target_groups = resolve_listen_groups()
+                target_signature = json.dumps(target_groups, ensure_ascii=False, sort_keys=True)
 
                 update_runtime(
                     current_listening_groups=active_groups,
                     desired_listening_groups=target_groups,
-                    last_discovered_groups=discovered_groups,
                 )
 
                 if not target_groups:
@@ -1271,16 +1241,25 @@ def main() -> None:
                             pass
                         active_processor = None
                         active_groups = []
+                        failed_target_signature = ""
                         update_runtime(current_listening_groups=[], desired_listening_groups=target_groups)
 
                     if not notified_waiting:
-                        print("暂未发现可监听群聊，机器人将持续重试。")
-                        print("你可以在面板填写群聊名称到 manual_groups，或先把群聊显示在微信左侧会话。")
+                        print("当前群聊监听失败：未查找到可监听群聊。")
+                        print("请在控制面板添加群聊，或点击监听查询后再监听。")
                         notified_waiting = True
                     time.sleep(poll_interval_seconds)
                     continue
 
                 if target_groups != active_groups or (reload_handler_required and active_processor is not None):
+                    if (
+                        target_groups != active_groups
+                        and active_processor is None
+                        and target_signature == failed_target_signature
+                    ):
+                        time.sleep(poll_interval_seconds)
+                        continue
+
                     if active_processor:
                         if target_groups != active_groups:
                             print("检测到监听群配置变化，正在重载监听...")
@@ -1314,25 +1293,12 @@ def main() -> None:
                         )
                         active_groups = list(target_groups)
                         notified_waiting = False
+                        failed_target_signature = ""
                         update_runtime(current_listening_groups=active_groups)
                         print(f"当前监听群({len(active_groups)}): {active_groups}")
                     except Exception as exc:
-                        # 兜底：单个群不可用时不要让整个机器人退出
-                        msg = str(exc)
-                        failed_group = None
-                        marker = "打开群聊失败:"
-                        if marker in msg:
-                            failed_group = msg.split(marker, 1)[1].strip()
-                        if failed_group:
-                            temporary_unavailable_groups[failed_group] = (
-                                time.time() + unavailable_cooldown_seconds
-                            )
-                            print(
-                                f"群聊暂不可用，已临时跳过 {failed_group!r} "
-                                f"({unavailable_cooldown_seconds}s 后重试)"
-                            )
-                        else:
-                            print(f"启动监听失败，将稍后重试: {exc}")
+                        failed_target_signature = target_signature
+                        print(f"当前群聊监听失败: {exc}")
                         active_processor = None
                         active_groups = []
                         update_runtime(current_listening_groups=[])

@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from examples.messaging.bookkeeping_config import CONFIG_PATH, load_config, save_config
+from examples.messaging.bookkeeping_config import (
+    CONFIG_PATH,
+    load_config,
+    save_config,
+    update_runtime,
+)
 
 
 def _split_csv(text: str) -> List[str]:
@@ -40,8 +46,65 @@ def _append_manual_group(name: str) -> Dict[str, Any]:
     if group_name not in manual_groups:
         manual_groups.append(group_name)
     config["manual_groups"] = manual_groups
+
+    exclude_groups = [
+        group for group in list(config.get("exclude_groups") or []) if group != group_name
+    ]
+    config["exclude_groups"] = exclude_groups
+
     save_config(config)
     return config
+
+
+def _append_manual_groups(names: List[str]) -> Dict[str, Any]:
+    group_names = [str(name or "").strip() for name in names]
+    group_names = [name for name in group_names if name]
+    if not group_names:
+        raise ValueError("未查找到可监听群聊")
+
+    config = load_config()
+    manual_groups = list(config.get("manual_groups") or [])
+    exclude_groups = list(config.get("exclude_groups") or [])
+    for group_name in group_names:
+        if group_name not in manual_groups:
+            manual_groups.append(group_name)
+        exclude_groups = [group for group in exclude_groups if group != group_name]
+    config["manual_groups"] = manual_groups
+    config["exclude_groups"] = exclude_groups
+    save_config(config)
+    return config
+
+
+def _remove_listen_group(name: str) -> Dict[str, Any]:
+    group_name = (name or "").strip()
+    if not group_name or group_name == "暂无":
+        raise ValueError("请先选择要删除的群聊")
+
+    config = load_config()
+    manual_groups = [group for group in list(config.get("manual_groups") or []) if group != group_name]
+    exclude_groups = list(config.get("exclude_groups") or [])
+    if group_name not in exclude_groups:
+        exclude_groups.append(group_name)
+    config["manual_groups"] = manual_groups
+    config["exclude_groups"] = exclude_groups
+    save_config(config)
+    return config
+
+
+def _discover_groups_now() -> List[str]:
+    from examples.messaging.group_bookkeeping_bot import discover_groups
+    from src import WeChatClient
+
+    with WeChatClient(auto_connect=True) as wx:
+        return discover_groups(wx)
+
+
+def _mark_listen_query_requested() -> None:
+    config = load_config()
+    runtime = dict(config.get("runtime") or {})
+    runtime["listen_query_requested_at"] = time.time()
+    config["runtime"] = runtime
+    save_config(config)
 
 
 def _to_form_data(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,6 +115,8 @@ def _to_form_data(config: Dict[str, Any]) -> Dict[str, Any]:
         "rollback_aliases_csv": ", ".join(command_aliases.get("rollback") or []),
         "bill_aliases_csv": ", ".join(command_aliases.get("bill") or []),
         "record_prefix_csv": ", ".join(command_aliases.get("record_prefix") or []),
+        "manual_groups": list(config.get("manual_groups") or []),
+        "exclude_groups": list(config.get("exclude_groups") or []),
         "runtime": runtime,
     }
 
@@ -109,13 +174,32 @@ class BookkeepingPanelWindow:
         left_col = QVBoxLayout()
         right_col = QVBoxLayout()
 
-        # --- 监听状态（仅当前已监听 + 添加） ---
+        # --- 监听状态 ---
         gb_listen = QGroupBox("监听状态")
         gl = QVBoxLayout(gb_listen)
-        gl.addWidget(QLabel("当前已监听的群（由机器人写入，重新加载可刷新）"))
+        gl.addWidget(QLabel("已监控的群（来自配置文件 manual_groups）"))
         self._listening = QListWidget()
-        self._listening.setMinimumHeight(200)
+        self._listening.setMinimumHeight(160)
         gl.addWidget(self._listening)
+
+        row_current = QHBoxLayout()
+        btn_remove_current = QPushButton("删除所选已监控群")
+        btn_remove_current.clicked.connect(self._on_remove_selected_listen)
+        row_current.addWidget(btn_remove_current)
+        row_current.addStretch()
+        gl.addLayout(row_current)
+
+        gl.addWidget(QLabel("机器人当前实际监听状态（由机器人运行时写入）"))
+        self._desired = QListWidget()
+        self._desired.setMinimumHeight(120)
+        gl.addWidget(self._desired)
+
+        row_query = QHBoxLayout()
+        btn_query = QPushButton("监听查询")
+        btn_query.clicked.connect(self._on_query_listen)
+        row_query.addWidget(btn_query)
+        row_query.addStretch()
+        gl.addLayout(row_query)
 
         row_add = QHBoxLayout()
         self._add_group_name = QLineEdit()
@@ -199,7 +283,12 @@ class BookkeepingPanelWindow:
             return
 
         rt = d.get("runtime") or {}
-        _fill_list_widget(self._listening, list(rt.get("current_listening_groups") or []))
+        excluded = set(d.get("exclude_groups") or [])
+        manual_groups = [
+            group for group in list(d.get("manual_groups") or []) if group not in excluded
+        ]
+        _fill_list_widget(self._listening, manual_groups)
+        _fill_list_widget(self._desired, list(rt.get("current_listening_groups") or []))
 
         self._help_aliases.setText(str(d.get("help_aliases_csv") or ""))
         self._rollback_aliases.setText(str(d.get("rollback_aliases_csv") or ""))
@@ -225,8 +314,8 @@ class BookkeepingPanelWindow:
             self._set_status(str(exc), error=True)
             QMessageBox.warning(self._win, "保存失败", str(exc))
             return
-        self._set_status("配置已保存")
         self._load_into_ui()
+        self._set_status("配置已保存")
 
     def _on_add_listen(self) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -242,8 +331,50 @@ class BookkeepingPanelWindow:
             QMessageBox.warning(self._win, "添加失败", str(exc))
             return
         self._add_group_name.clear()
-        self._set_status("已添加监听，机器人将自动重载")
         self._load_into_ui()
+        self._set_status("已添加监听，机器人将自动重载")
+
+    @staticmethod
+    def _selected_group(widget: Any) -> str:
+        item = widget.currentItem()
+        if item is None:
+            return ""
+        return item.text().strip()
+
+    def _remove_group(self, group_name: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        if not group_name or group_name == "暂无":
+            self._set_status("请先选择要删除的群聊", error=True)
+            return
+        try:
+            _remove_listen_group(group_name)
+        except Exception as exc:
+            self._set_status(str(exc), error=True)
+            QMessageBox.warning(self._win, "删除失败", str(exc))
+            return
+        self._load_into_ui()
+        self._set_status(f"已删除监听：{group_name}，机器人将自动重载")
+
+    def _on_query_listen(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        self._set_status("正在查询当前可监听群聊...")
+        try:
+            groups = _discover_groups_now()
+            update_runtime(last_discovered_groups=groups)
+            _append_manual_groups(groups)
+            _mark_listen_query_requested()
+        except Exception as exc:
+            self._load_into_ui()
+            self._set_status(f"当前群聊监听失败：{exc}", error=True)
+            QMessageBox.warning(self._win, "监听查询失败", str(exc))
+            return
+        self._load_into_ui()
+        self._set_status(f"监听查询完成，已加入 {len(groups)} 个群聊")
+
+    def _on_remove_selected_listen(self) -> None:
+        self._remove_group(self._selected_group(self._listening))
 
     def show(self) -> None:
         self._load_into_ui()
