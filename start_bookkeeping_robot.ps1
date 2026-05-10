@@ -24,6 +24,21 @@ if ($InstallDeps) {
     }
 }
 
+if (-not $InstallDeps) {
+    & python -c "import PySide6, win32api, comtypes, pyperclip" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Some dependencies are missing. Installing dependencies now..." -ForegroundColor Yellow
+        & python -m pip install -r requirements.txt
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Dependency installation failed. Please check your network and Python environment." -ForegroundColor Red
+            Write-Host "You can also run this manually:"
+            Write-Host "python -m pip install -r requirements.txt"
+            Read-Host "Press Enter to exit"
+            exit $LASTEXITCODE
+        }
+    }
+}
+
 $RunDir = Join-Path $Root ".run"
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
