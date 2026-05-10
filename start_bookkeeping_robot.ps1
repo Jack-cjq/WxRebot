@@ -25,8 +25,13 @@ if ($InstallDeps) {
 }
 
 if (-not $InstallDeps) {
-    & python -c "import PySide6, win32api, comtypes, pyperclip" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & python -c "import PySide6, win32api, comtypes, pyperclip" *> $null
+    $DependencyCheckCode = $LASTEXITCODE
+    $ErrorActionPreference = $PreviousErrorActionPreference
+
+    if ($DependencyCheckCode -ne 0) {
         Write-Host "Some dependencies are missing. Installing dependencies now..." -ForegroundColor Yellow
         & python -m pip install -r requirements.txt
         if ($LASTEXITCODE -ne 0) {
